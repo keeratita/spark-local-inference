@@ -59,7 +59,9 @@ pub use selection::LoadOptions;
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::ptr::{null, null_mut};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread;
 
 use crate::{
     BufferSpan, GraphBundle, Result,
@@ -89,7 +91,6 @@ pub struct NativeResources {
     allocations: HashMap<String, Storage>,
     modules: Vec<Handle>,
     functions: HashMap<usize, Handle>,
-    templates: Vec<Handle>,
     executables: Vec<Handle>,
     names: Vec<String>,
     reservations: Vec<(u64, usize)>,
@@ -117,6 +118,418 @@ fn clamp_cooperative_grid(mut grid: [u32; 3], capacity: u64) -> Result<[u32; 3]>
     }
     grid[axis] = u64::from(grid[axis]).min(max_workers) as u32;
     Ok(grid)
+}
+
+/// Graph templates rebuild with a bounded worker pool per rank, matching the
+/// scale of the payload reader pools. Graph construction is host-side driver
+/// work; each builder binds the owner's context on its own thread.
+const GRAPH_WORKERS: usize = 4;
+
+/// Resolved binding inputs shared by concurrent graph builders. CUDA handles
+/// travel as integers so builder results and lookups can cross thread
+/// boundaries; the resource owner re-derives handles when it commits results.
+struct Bindings {
+    driver: Arc<Driver>,
+    context: usize,
+    device: i32,
+    addresses: HashMap<String, u64>,
+    functions: HashMap<usize, usize>,
+    events: HashMap<String, usize>,
+}
+
+impl Bindings {
+    fn from(owner: &NativeResources) -> Self {
+        Self {
+            driver: owner.driver.clone(),
+            context: owner.context as usize,
+            device: owner.device,
+            addresses: owner
+                .allocations
+                .iter()
+                .map(|(name, storage)| (name.clone(), storage.address))
+                .collect(),
+            functions: owner
+                .functions
+                .iter()
+                .map(|(id, handle)| (*id, *handle as usize))
+                .collect(),
+            events: owner
+                .events
+                .iter()
+                .map(|(name, handle)| (name.clone(), *handle as usize))
+                .collect(),
+        }
+    }
+
+    fn address(&self, reference: &Reference) -> Result<u64> {
+        let base = self
+            .addresses
+            .get(&reference.allocation)
+            .ok_or_else(|| invalid(format!("unknown allocation {}", reference.allocation)))?;
+        Ok(base + reference.offset as u64)
+    }
+
+    fn relocate(&self, data: &mut [u8], relocation: &Relocation, offset: usize) -> Result<()> {
+        let address = self.address(&relocation.target)?;
+        match relocation.kind {
+            RelocationKind::Pointer => {
+                data[offset..offset + 8].copy_from_slice(&address.to_le_bytes())
+            }
+            RelocationKind::TensorMap => {
+                let mut descriptor = TensorMap(data[offset..offset + 128].try_into().unwrap());
+                // SAFETY: TensorMap has CUDA's required 64-byte alignment. The
+                // descriptor and replacement allocation were validated before use.
+                self.driver.check("cuTensorMapReplaceAddress", unsafe {
+                    (self.driver.tensor_map_replace)(&mut descriptor, address as Handle)
+                })?;
+                data[offset..offset + 128].copy_from_slice(&descriptor.0);
+            }
+        }
+        Ok(())
+    }
+
+    fn bind(&self, blob: &Blob) -> Result<Vec<u8>> {
+        let mut data = blob.data.clone();
+        for relocation in &blob.relocations {
+            self.relocate(&mut data, relocation, relocation.offset)?;
+        }
+        Ok(data)
+    }
+
+    unsafe fn clamp_cooperative_launch(&self, params: &mut KernelParams) -> Result<()> {
+        let driver = &self.driver;
+        let threads = params
+            .block
+            .iter()
+            .try_fold(1i32, |n, &dim| n.checked_mul(i32::try_from(dim).ok()?))
+            .ok_or_else(|| invalid("cooperative kernel block size overflow"))?;
+        let (mut blocks_per_sm, mut sms) = (0, 0);
+        unsafe {
+            self.driver.check(
+                "cuOccupancyMaxActiveBlocksPerMultiprocessor",
+                (driver.occupancy)(
+                    &mut blocks_per_sm,
+                    params.function,
+                    threads,
+                    params.shared as usize,
+                ),
+            )?;
+            self.driver.check(
+                "cuDeviceGetAttribute",
+                (driver.device_attribute)(&mut sms, 16, self.device),
+            )?;
+        }
+        if blocks_per_sm <= 0 || sms <= 0 {
+            return Err(invalid("cooperative kernel has no resident CTA capacity"));
+        }
+        let capacity = blocks_per_sm as u64 * sms as u64;
+        params.grid = clamp_cooperative_grid(params.grid, capacity)?;
+        Ok(())
+    }
+
+    /// Rebuild one graph template, upload its executable, and destroy the
+    /// template. The caller owns the returned executable until it commits it to
+    /// the resource owner; this builder destroys it if the upload fails.
+    unsafe fn build_graph<F: payload::Files>(
+        &self,
+        files: &F,
+        package: &Package,
+        graph: &format::Graph,
+        phase: &Phase,
+        dynamic_shared: &Mutex<HashMap<usize, u32>>,
+    ) -> Result<Handle> {
+        let driver = &self.driver;
+        unsafe {
+            driver.check(
+                "cuCtxSetCurrent",
+                (driver.context_set)(self.context as Handle),
+            )?;
+            let mut handle = null_mut();
+            driver.check("cuGraphCreate", (driver.graph_create)(&mut handle, 0))?;
+            if let Err(error) =
+                self.build_nodes(files, package, graph, handle, phase, dynamic_shared)
+            {
+                (driver.graph_destroy)(handle);
+                return Err(error);
+            }
+            let mut executable = null_mut();
+            if let Err(error) = driver.check(
+                "cuGraphInstantiateWithFlags",
+                (driver.graph_instantiate)(&mut executable, handle, graph.flags),
+            ) {
+                (driver.graph_destroy)(handle);
+                return Err(error);
+            }
+            let uploaded = driver.check(
+                "cuGraphUpload",
+                (driver.graph_upload)(executable, null_mut()),
+            );
+            // The instantiated executable owns a complete copy of the topology;
+            // the template is retired once its upload is enqueued. A destroy
+            // failure leaks the template only; failing here would also strand
+            // the executable, which the caller has not yet taken ownership of.
+            (driver.graph_destroy)(handle);
+            if let Err(error) = uploaded {
+                (driver.executable_destroy)(executable);
+                return Err(error);
+            }
+            phase.advance(1);
+            Ok(executable)
+        }
+    }
+
+    /// Add every declared node and dependency of one graph to its template.
+    unsafe fn build_nodes<F: payload::Files>(
+        &self,
+        files: &F,
+        package: &Package,
+        graph: &format::Graph,
+        handle: Handle,
+        phase: &Phase,
+        dynamic_shared: &Mutex<HashMap<usize, u32>>,
+    ) -> Result<Vec<Handle>> {
+        let driver = &self.driver;
+        unsafe {
+            let mut nodes = Vec::with_capacity(graph.node_count);
+            let mut records = files.records(package, &graph.resource)?;
+            for _ in 0..graph.node_count {
+                let node = protobuf::node(records.read()?)?;
+                package.validate_node(&node)?;
+                if let Node::Kernel { function, .. } = &node {
+                    if !graph.functions.contains(function) {
+                        return Err(invalid("graph kernel is absent from its dependency index"));
+                    }
+                }
+                let node = &node;
+                let mut result = null_mut();
+                match node {
+                    Node::Kernel {
+                        function,
+                        grid,
+                        block,
+                        shared,
+                        arguments,
+                        attributes,
+                    } => {
+                        let function_handle = *self
+                            .functions
+                            .get(function)
+                            .ok_or_else(|| invalid("graph kernel has no loaded function"))?
+                            as Handle;
+                        // Captured nodes retain their launch requirements even if later
+                        // preparation lowers the function's dynamic shared-memory allowance.
+                        {
+                            let mut allowances = dynamic_shared.lock().unwrap();
+                            let allowance = allowances
+                                .get_mut(&(function_handle as usize))
+                                .ok_or_else(|| invalid("graph kernel has no loaded function"))?;
+                            if *shared > *allowance {
+                                let bytes = i32::try_from(*shared).map_err(|_| {
+                                    invalid(
+                                        "kernel shared-memory size exceeds CUDA's attribute range",
+                                    )
+                                })?;
+                                driver.check(
+                                    "cuFuncSetAttribute(MAX_DYNAMIC_SHARED_SIZE_BYTES)",
+                                    (driver.function_attribute)(function_handle, 8, bytes),
+                                )?;
+                                *allowance = *shared;
+                            }
+                        }
+                        let mut storage = arguments
+                            .iter()
+                            .map(|a| self.bind(a))
+                            .collect::<Result<Vec<_>>>()?;
+                        let mut pointers: Vec<_> =
+                            storage.iter_mut().map(|a| a.as_mut_ptr().cast()).collect();
+                        let mut params = KernelParams {
+                            function: function_handle,
+                            grid: *grid,
+                            block: *block,
+                            shared: *shared,
+                            arguments: pointers.as_mut_ptr(),
+                            extra: null_mut(),
+                            kernel: null_mut(),
+                            context: null_mut(),
+                        };
+                        let status = (driver.graph_kernel)(&mut result, handle, null(), 0, &params);
+                        if status != 0 {
+                            let symbol = package
+                                .functions
+                                .iter()
+                                .find(|entry| entry.id == *function)
+                                .map(|entry| entry.symbol.as_str())
+                                .unwrap_or("unknown");
+                            driver.check(
+                                &format!(
+                                    "cuGraphAddKernelNode_v2 for graph {} node {} kernel {symbol} (grid {grid:?}, block {block:?}, shared {shared})",
+                                    graph.name, nodes.len()
+                                ),
+                                status,
+                            )?;
+                        }
+                        for attribute in attributes {
+                            let bytes = self.bind(&attribute.value)?;
+                            let mut value = [0u64; 8];
+                            std::ptr::copy_nonoverlapping(
+                                bytes.as_ptr(),
+                                value.as_mut_ptr().cast(),
+                                64,
+                            );
+                            let mut status = (driver.graph_attribute)(
+                                result,
+                                attribute.id,
+                                value.as_ptr().cast(),
+                            );
+                            if attribute.id == 2 && value[0] as u32 != 0 && status == 720 {
+                                self.clamp_cooperative_launch(&mut params)?;
+                                driver.check(
+                                    "cuGraphKernelNodeSetParams_v2",
+                                    (driver.graph_kernel_params)(result, &params),
+                                )?;
+                                status = (driver.graph_attribute)(
+                                    result,
+                                    attribute.id,
+                                    value.as_ptr().cast(),
+                                );
+                            }
+                            driver.check("cuGraphKernelNodeSetAttribute", status)?;
+                        }
+                    }
+                    Node::Memset {
+                        destination,
+                        pitch,
+                        value,
+                        element_size,
+                        width,
+                        height,
+                    } => {
+                        let params = MemsetParams {
+                            destination: self.address(destination)?,
+                            pitch: *pitch,
+                            value: *value,
+                            element_size: *element_size,
+                            width: *width,
+                            height: *height,
+                        };
+                        driver.check(
+                            "cuGraphAddMemsetNode",
+                            (driver.graph_memset)(
+                                &mut result,
+                                handle,
+                                null(),
+                                0,
+                                &params,
+                                self.context as Handle,
+                            ),
+                        )?;
+                    }
+                    Node::Empty => {
+                        driver.check(
+                            "cuGraphAddEmptyNode",
+                            (driver.graph_empty)(&mut result, handle, null(), 0),
+                        )?;
+                    }
+                    Node::EventWait { event } => {
+                        let event = *self
+                            .events
+                            .get(event)
+                            .ok_or_else(|| invalid("graph waits on an absent event"))?;
+                        driver.check(
+                            "cuGraphAddEventWaitNode",
+                            (driver.graph_event_wait)(
+                                &mut result,
+                                handle,
+                                null(),
+                                0,
+                                event as Handle,
+                            ),
+                        )?;
+                    }
+                    Node::Copy {
+                        source,
+                        destination,
+                        nbytes,
+                    } => {
+                        let endpoint = |reference| -> Result<CopyEndpoint> {
+                            Ok(CopyEndpoint {
+                                memory_type: 2,
+                                device: self.address(reference)?,
+                                pitch: *nbytes,
+                                height: 1,
+                                ..CopyEndpoint::default()
+                            })
+                        };
+                        let params = CopyParams {
+                            source: endpoint(source)?,
+                            destination: endpoint(destination)?,
+                            width: *nbytes,
+                            height: 1,
+                            depth: 1,
+                        };
+                        driver.check(
+                            "cuGraphAddMemcpyNode",
+                            (driver.graph_copy)(
+                                &mut result,
+                                handle,
+                                null(),
+                                0,
+                                &params,
+                                self.context as Handle,
+                            ),
+                        )?;
+                    }
+                }
+                nodes.push(result);
+                phase.advance(1);
+            }
+            let mut dependencies = format::Dependencies::new(graph.node_count);
+            let add_dependencies = |sources: &mut Vec<Handle>,
+                                    destinations: &mut Vec<Handle>,
+                                    data: &mut Vec<[u8; 8]>|
+             -> Result<()> {
+                if sources.is_empty() {
+                    return Ok(());
+                }
+                driver.check(
+                    "cuGraphAddDependencies_v2",
+                    (driver.graph_edges)(
+                        handle,
+                        sources.as_ptr(),
+                        destinations.as_ptr(),
+                        data.as_ptr(),
+                        data.len(),
+                    ),
+                )?;
+                sources.clear();
+                destinations.clear();
+                data.clear();
+                Ok(())
+            };
+            for begin in (0..graph.edge_count).step_by(4096) {
+                let mut sources = Vec::new();
+                let mut destinations = Vec::new();
+                let mut data = Vec::new();
+                for _ in begin..(begin + 4096).min(graph.edge_count) {
+                    let edge = protobuf::edge(records.read()?)?;
+                    dependencies.add(&edge)?;
+                    if data.last().is_some_and(|previous| previous != &edge.data) {
+                        // A mixed batch can apply its first annotation to every
+                        // edge. Flush at each change so programmatic ports and
+                        // types survive without changing captured edge order.
+                        add_dependencies(&mut sources, &mut destinations, &mut data)?;
+                    }
+                    sources.push(nodes[edge.source]);
+                    destinations.push(nodes[edge.destination]);
+                    data.push(edge.data);
+                }
+                add_dependencies(&mut sources, &mut destinations, &mut data)?;
+            }
+            dependencies.finish()?;
+            records.finish()?;
+            Ok(nodes)
+        }
+    }
 }
 
 /// An accepted package from either on-disk format, ready for a loader entry point.
@@ -346,7 +759,6 @@ impl NativeResources {
                 allocations: HashMap::new(),
                 modules: vec![],
                 functions: HashMap::new(),
-                templates: vec![],
                 executables: vec![],
                 names: vec![],
                 reservations: vec![],
@@ -383,37 +795,6 @@ impl NativeResources {
             }
             Ok(owner)
         }
-    }
-
-    fn address(&self, reference: &Reference) -> u64 {
-        self.allocations[&reference.allocation].address + reference.offset as u64
-    }
-
-    fn relocate(&self, data: &mut [u8], relocation: &Relocation, offset: usize) -> Result<()> {
-        let address = self.address(&relocation.target);
-        match relocation.kind {
-            RelocationKind::Pointer => {
-                data[offset..offset + 8].copy_from_slice(&address.to_le_bytes())
-            }
-            RelocationKind::TensorMap => {
-                let mut descriptor = TensorMap(data[offset..offset + 128].try_into().unwrap());
-                // SAFETY: TensorMap has CUDA's required 64-byte alignment. The
-                // descriptor and replacement allocation were validated before use.
-                self.driver.check("cuTensorMapReplaceAddress", unsafe {
-                    (self.driver.tensor_map_replace)(&mut descriptor, address as Handle)
-                })?;
-                data[offset..offset + 128].copy_from_slice(&descriptor.0);
-            }
-        }
-        Ok(())
-    }
-
-    fn bind(&self, blob: &Blob) -> Result<Vec<u8>> {
-        let mut data = blob.data.clone();
-        for relocation in &blob.relocations {
-            self.relocate(&mut data, relocation, relocation.offset)?;
-        }
-        Ok(data)
     }
 
     unsafe fn reserve(&mut self, package: &Package) -> Result<()> {
@@ -640,6 +1021,7 @@ impl NativeResources {
         ranks: usize,
     ) -> Result<()> {
         let driver = self.driver.clone();
+        let bindings = Bindings::from(self);
         unsafe {
             driver.check("cuCtxSetCurrent", (driver.context_set)(self.context))?;
             payload::load(self, files, package, phase, ranks)?;
@@ -652,7 +1034,7 @@ impl NativeResources {
                         "cuMemcpyDtoH_v2",
                         (driver.download)(bytes.as_mut_ptr().cast(), address, bytes.len()),
                     )?;
-                    self.relocate(&mut bytes, relocation, 0)?;
+                    bindings.relocate(&mut bytes, relocation, 0)?;
                     driver.check(
                         "cuMemcpyHtoD_v2",
                         (driver.upload)(address, bytes.as_ptr().cast(), bytes.len()),
@@ -670,6 +1052,7 @@ impl NativeResources {
         phase: &Phase,
     ) -> Result<()> {
         let driver = self.driver.clone();
+        let bindings = Bindings::from(self);
         unsafe {
             driver.check("cuCtxSetCurrent", (driver.context_set)(self.context))?;
             let mut modules = HashMap::new();
@@ -700,7 +1083,7 @@ impl NativeResources {
                         )));
                     }
                     for relocation in &global.relocations {
-                        self.relocate(&mut contents, relocation, relocation.offset)?;
+                        bindings.relocate(&mut contents, relocation, relocation.offset)?;
                     }
                     driver.check(
                         "cuMemcpyHtoD_v2",
@@ -768,294 +1151,115 @@ impl NativeResources {
                 driver.check("cuEventCreate", (driver.event_create)(&mut event, 2))?;
                 self.events.insert(name.clone(), event);
             }
-            let mut dynamic_shared = HashMap::new();
-            for &function in self.functions.values() {
+        }
+        let bindings = Bindings::from(self);
+        let mut dynamic_shared = HashMap::new();
+        unsafe {
+            driver.check("cuCtxSetCurrent", (driver.context_set)(self.context))?;
+            for &function in bindings.functions.values() {
                 let mut bytes = 0;
                 driver.check(
                     "cuFuncGetAttribute(MAX_DYNAMIC_SHARED_SIZE_BYTES)",
-                    (driver.function_get_attribute)(&mut bytes, 8, function),
+                    (driver.function_get_attribute)(&mut bytes, 8, function as Handle),
                 )?;
-                dynamic_shared.insert(function as usize, bytes as u32);
+                dynamic_shared.insert(function, bytes as u32);
             }
-            for graph in &package.graphs {
-                let mut handle = null_mut();
-                driver.check("cuGraphCreate", (driver.graph_create)(&mut handle, 0))?;
-                self.templates.push(handle);
-                let mut nodes = Vec::with_capacity(graph.node_count);
-                let mut records = files.records(package, &graph.resource)?;
-                for _ in 0..graph.node_count {
-                    let node = protobuf::node(records.read()?)?;
-                    package.validate_node(&node)?;
-                    if let Node::Kernel { function, .. } = &node {
-                        if !graph.functions.contains(function) {
-                            return Err(invalid(
-                                "graph kernel is absent from its dependency index",
-                            ));
-                        }
-                    }
-                    let node = &node;
-                    let mut result = null_mut();
-                    match node {
-                        Node::Kernel {
-                            function,
-                            grid,
-                            block,
-                            shared,
-                            arguments,
-                            attributes,
-                        } => {
-                            let function_handle = self.functions[function];
-                            let allowance =
-                                dynamic_shared.get_mut(&(function_handle as usize)).unwrap();
-                            // Captured nodes retain their launch requirements even if later
-                            // preparation lowers the function's dynamic shared-memory allowance.
-                            if *shared > *allowance {
-                                let bytes = i32::try_from(*shared).map_err(|_| {
-                                    invalid(
-                                        "kernel shared-memory size exceeds CUDA's attribute range",
-                                    )
-                                })?;
-                                driver.check(
-                                    "cuFuncSetAttribute(MAX_DYNAMIC_SHARED_SIZE_BYTES)",
-                                    (driver.function_attribute)(function_handle, 8, bytes),
-                                )?;
-                                *allowance = *shared;
-                            }
-                            let mut storage = arguments
-                                .iter()
-                                .map(|a| self.bind(a))
-                                .collect::<Result<Vec<_>>>()?;
-                            let mut pointers: Vec<_> =
-                                storage.iter_mut().map(|a| a.as_mut_ptr().cast()).collect();
-                            let mut params = KernelParams {
-                                function: function_handle,
-                                grid: *grid,
-                                block: *block,
-                                shared: *shared,
-                                arguments: pointers.as_mut_ptr(),
-                                extra: null_mut(),
-                                kernel: null_mut(),
-                                context: null_mut(),
-                            };
-                            let status =
-                                (driver.graph_kernel)(&mut result, handle, null(), 0, &params);
-                            if status != 0 {
-                                let symbol = package
-                                    .functions
-                                    .iter()
-                                    .find(|entry| entry.id == *function)
-                                    .map(|entry| entry.symbol.as_str())
-                                    .unwrap_or("unknown");
-                                driver.check(
-                                    &format!(
-                                        "cuGraphAddKernelNode_v2 for graph {} node {} kernel {symbol} (grid {grid:?}, block {block:?}, shared {shared})",
-                                        graph.name, nodes.len()
-                                    ),
-                                    status,
-                                )?;
-                            }
-                            for attribute in attributes {
-                                let bytes = self.bind(&attribute.value)?;
-                                let mut value = [0u64; 8];
-                                std::ptr::copy_nonoverlapping(
-                                    bytes.as_ptr(),
-                                    value.as_mut_ptr().cast(),
-                                    64,
-                                );
-                                let mut status = (driver.graph_attribute)(
-                                    result,
-                                    attribute.id,
-                                    value.as_ptr().cast(),
-                                );
-                                if attribute.id == 2 && value[0] as u32 != 0 && status == 720 {
-                                    self.clamp_cooperative_launch(&mut params)?;
-                                    driver.check(
-                                        "cuGraphKernelNodeSetParams_v2",
-                                        (driver.graph_kernel_params)(result, &params),
-                                    )?;
-                                    status = (driver.graph_attribute)(
-                                        result,
-                                        attribute.id,
-                                        value.as_ptr().cast(),
-                                    );
+        }
+        let dynamic_shared = Mutex::new(dynamic_shared);
+        // Builders claim graph indexes atomically and stop after any failure;
+        // the first failure in graph order is the one reported. Executables are
+        // committed in package order so replay ordinals match the execution
+        // manifest. Each builder destroys its own template and any executable
+        // whose upload failed before returning.
+        let bindings = &bindings;
+        let next = AtomicUsize::new(0);
+        let failed = AtomicBool::new(false);
+        let results: Mutex<Vec<Option<Result<(usize, String)>>>> =
+            Mutex::new((0..package.graphs.len()).map(|_| None).collect());
+        let scope_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            thread::scope(|scope| -> Result<()> {
+                for worker in 0..GRAPH_WORKERS.min(package.graphs.len()) {
+                    let (next, failed, results, dynamic_shared) =
+                        (&next, &failed, &results, &dynamic_shared);
+                    thread::Builder::new()
+                        .name(format!("flare-graph-{worker}"))
+                        .spawn_scoped(scope, move || {
+                            loop {
+                                if failed.load(Ordering::Relaxed) {
+                                    return;
                                 }
-                                driver.check("cuGraphKernelNodeSetAttribute", status)?;
+                                let index = next.fetch_add(1, Ordering::Relaxed);
+                                let Some(graph) = package.graphs.get(index) else {
+                                    return;
+                                };
+                                match unsafe {
+                                    bindings.build_graph(
+                                        files,
+                                        package,
+                                        graph,
+                                        phase,
+                                        dynamic_shared,
+                                    )
+                                } {
+                                    Ok(executable) => {
+                                        results.lock().unwrap()[index] =
+                                            Some(Ok((executable as usize, graph.name.clone())));
+                                    }
+                                    Err(error) => {
+                                        results.lock().unwrap()[index] = Some(Err(error));
+                                        failed.store(true, Ordering::Relaxed);
+                                    }
+                                }
                             }
-                        }
-                        Node::Memset {
-                            destination,
-                            pitch,
-                            value,
-                            element_size,
-                            width,
-                            height,
-                        } => {
-                            let params = MemsetParams {
-                                destination: self.address(destination),
-                                pitch: *pitch,
-                                value: *value,
-                                element_size: *element_size,
-                                width: *width,
-                                height: *height,
-                            };
-                            driver.check(
-                                "cuGraphAddMemsetNode",
-                                (driver.graph_memset)(
-                                    &mut result,
-                                    handle,
-                                    null(),
-                                    0,
-                                    &params,
-                                    self.context,
-                                ),
-                            )?;
-                        }
-                        Node::Empty => {
-                            driver.check(
-                                "cuGraphAddEmptyNode",
-                                (driver.graph_empty)(&mut result, handle, null(), 0),
-                            )?;
-                        }
-                        Node::EventWait { event } => {
-                            driver.check(
-                                "cuGraphAddEventWaitNode",
-                                (driver.graph_event_wait)(
-                                    &mut result,
-                                    handle,
-                                    null(),
-                                    0,
-                                    self.events[event],
-                                ),
-                            )?;
-                        }
-                        Node::Copy {
-                            source,
-                            destination,
-                            nbytes,
-                        } => {
-                            let endpoint = |reference| CopyEndpoint {
-                                memory_type: 2,
-                                device: self.address(reference),
-                                pitch: *nbytes,
-                                height: 1,
-                                ..CopyEndpoint::default()
-                            };
-                            let params = CopyParams {
-                                source: endpoint(source),
-                                destination: endpoint(destination),
-                                width: *nbytes,
-                                height: 1,
-                                depth: 1,
-                            };
-                            driver.check(
-                                "cuGraphAddMemcpyNode",
-                                (driver.graph_copy)(
-                                    &mut result,
-                                    handle,
-                                    null(),
-                                    0,
-                                    &params,
-                                    self.context,
-                                ),
-                            )?;
-                        }
-                    }
-                    nodes.push(result);
-                    phase.advance(1);
+                        })
+                        .map_err(|error| invalid(format!("spawn graph builder: {error}")))?;
                 }
-                let mut dependencies = format::Dependencies::new(graph.node_count);
-                let add_dependencies = |sources: &mut Vec<Handle>,
-                                        destinations: &mut Vec<Handle>,
-                                        data: &mut Vec<[u8; 8]>|
-                 -> Result<()> {
-                    if sources.is_empty() {
-                        return Ok(());
-                    }
-                    driver.check(
-                        "cuGraphAddDependencies_v2",
-                        (driver.graph_edges)(
-                            handle,
-                            sources.as_ptr(),
-                            destinations.as_ptr(),
-                            data.as_ptr(),
-                            data.len(),
-                        ),
-                    )?;
-                    sources.clear();
-                    destinations.clear();
-                    data.clear();
-                    Ok(())
-                };
-                for begin in (0..graph.edge_count).step_by(4096) {
-                    let mut sources = Vec::new();
-                    let mut destinations = Vec::new();
-                    let mut data = Vec::new();
-                    for _ in begin..(begin + 4096).min(graph.edge_count) {
-                        let edge = protobuf::edge(records.read()?)?;
-                        dependencies.add(&edge)?;
-                        if data.last().is_some_and(|previous| previous != &edge.data) {
-                            // A mixed batch can apply its first annotation to every
-                            // edge. Flush at each change so programmatic ports and
-                            // types survive without changing captured edge order.
-                            add_dependencies(&mut sources, &mut destinations, &mut data)?;
-                        }
-                        sources.push(nodes[edge.source]);
-                        destinations.push(nodes[edge.destination]);
-                        data.push(edge.data);
-                    }
-                    add_dependencies(&mut sources, &mut destinations, &mut data)?;
+                Ok(())
+            })
+        }));
+        // Commit every completed executable before propagating any failure,
+        // including a spawn error or builder panic, so the owner's Drop
+        // frees them all.
+        let mut results = results
+            .into_inner()
+            .map_err(|_| invalid("graph builders panicked"))?;
+        let mut failure: Option<crate::Error> = None;
+        for (index, result) in results.drain(..).enumerate() {
+            match result {
+                Some(Ok((executable, name))) => {
+                    self.executables.push(executable as Handle);
+                    self.names.push(name);
                 }
-                dependencies.finish()?;
-                records.finish()?;
-                let mut executable = null_mut();
-                driver.check(
-                    "cuGraphInstantiateWithFlags",
-                    (driver.graph_instantiate)(&mut executable, handle, graph.flags),
-                )?;
-                self.executables.push(executable);
-                self.names.push(graph.name.clone());
-                driver.check(
-                    "cuGraphUpload",
-                    (driver.graph_upload)(executable, null_mut()),
-                )?;
-                driver.check("cuCtxSynchronize", (driver.context_sync)())?;
-                driver.check("cuGraphDestroy", (driver.graph_destroy)(handle))?;
-                self.templates.pop();
-                phase.advance(1);
+                Some(Err(error)) => {
+                    if failure.is_none() {
+                        failure = Some(error);
+                    }
+                }
+                None => {
+                    if failure.is_none() {
+                        failure = Some(invalid(format!(
+                            "graph {} was not built",
+                            package.graphs[index].name
+                        )));
+                    }
+                }
             }
-            self.functions.clear();
+        }
+        if failure.is_none() {
+            failure = match scope_result {
+                Ok(result) => result.err(),
+                Err(_) => Some(invalid("a graph builder panicked")),
+            };
+        }
+        if let Some(error) = failure {
+            return Err(error);
+        }
+        // Uploads were enqueued asynchronously per graph; drain them once
+        // before the owner proceeds to cache allocation and replay.
+        unsafe {
             driver.check("cuCtxSynchronize", (driver.context_sync)())?;
         }
-        Ok(())
-    }
-
-    unsafe fn clamp_cooperative_launch(&self, params: &mut KernelParams) -> Result<()> {
-        let threads = params
-            .block
-            .iter()
-            .try_fold(1i32, |n, &dim| n.checked_mul(i32::try_from(dim).ok()?))
-            .ok_or_else(|| invalid("cooperative kernel block size overflow"))?;
-        let (mut blocks_per_sm, mut sms) = (0, 0);
-        unsafe {
-            self.driver.check(
-                "cuOccupancyMaxActiveBlocksPerMultiprocessor",
-                (self.driver.occupancy)(
-                    &mut blocks_per_sm,
-                    params.function,
-                    threads,
-                    params.shared as usize,
-                ),
-            )?;
-            self.driver.check(
-                "cuDeviceGetAttribute",
-                (self.driver.device_attribute)(&mut sms, 16, self.device),
-            )?;
-        }
-        if blocks_per_sm <= 0 || sms <= 0 {
-            return Err(invalid("cooperative kernel has no resident CTA capacity"));
-        }
-        let capacity = blocks_per_sm as u64 * sms as u64;
-        params.grid = clamp_cooperative_grid(params.grid, capacity)?;
+        self.functions.clear();
         Ok(())
     }
 
@@ -1153,15 +1357,14 @@ impl Drop for NativeResources {
             for executable in self.executables.iter().rev() {
                 (self.driver.executable_destroy)(*executable);
             }
-            for graph in self.templates.iter().rev() {
-                (self.driver.graph_destroy)(*graph);
-            }
             for event in self.events.values() {
                 (self.driver.event_destroy)(*event);
             }
             for module in self.modules.iter().rev() {
                 (self.driver.module_unload)(*module);
             }
+            // Graph templates are destroyed by their builder once the executable
+            // owns the topology, so no template outlives graph construction.
             for allocation in self.allocations.values() {
                 if allocation.nbytes == 0 {
                     continue;

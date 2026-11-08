@@ -510,8 +510,11 @@ cache configuration; reserve the recorded range and compare addresses; back
 each device allocation at its recorded address and map each host region;
 upload contents or zero-fill; apply storage relocations; load modules and
 resolve functions, checking each kernel's parameter layout against the
-package; set function attributes; add nodes, attributes, and edges; and
-instantiate each graph with its recorded flags. The execution manifest is
+package; set function attributes; and rebuild the graphs through a bounded
+pool of builder threads: each builder adds nodes, attributes, and edges to a
+template, instantiates it with its recorded flags, uploads the executable,
+and destroys the template. One context synchronization drains the queued
+uploads after every builder finishes. The execution manifest is
 then rebased onto the live addresses and validated, and the server starts
 from this reconstructed contract. `flare run PACKAGE` in
 `flare/src/main.rs` starts the shared server directly from the typed contract.
