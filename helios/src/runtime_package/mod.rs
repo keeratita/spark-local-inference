@@ -125,6 +125,46 @@ fn clamp_cooperative_grid(mut grid: [u32; 3], capacity: u64) -> Result<[u32; 3]>
 /// work; each builder binds the owner's context on its own thread.
 const GRAPH_WORKERS: usize = 4;
 
+/// One builder's outcome for one graph: the uploaded executable's integer
+/// handle and graph name, or the failure that stopped the build.
+type GraphBuildResult = Result<(usize, String)>;
+
+/// Destroys one CUDA graph or executable handle while unwinding unless the
+/// builder retires it first, so a panic during graph construction cannot
+/// leak a template or an executable the owner has not committed.
+struct HandleGuard {
+    destroy: unsafe extern "C" fn(Handle) -> std::os::raw::c_int,
+    handle: Handle,
+    armed: bool,
+}
+
+impl HandleGuard {
+    fn new(
+        destroy: unsafe extern "C" fn(Handle) -> std::os::raw::c_int,
+        handle: Handle,
+    ) -> Self {
+        Self {
+            destroy,
+            handle,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for HandleGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            // SAFETY: The paired driver call created this handle and no
+            // other owner destroys it while the guard is armed.
+            unsafe { (self.destroy)(self.handle) };
+        }
+    }
+}
+
 /// Resolved binding inputs shared by concurrent graph builders. CUDA handles
 /// travel as integers so builder results and lookups can cross thread
 /// boundaries; the resource owner re-derives handles when it commits results.
@@ -228,8 +268,9 @@ impl Bindings {
     }
 
     /// Rebuild one graph template, upload its executable, and destroy the
-    /// template. The caller owns the returned executable until it commits it to
-    /// the resource owner; this builder destroys it if the upload fails.
+    /// template. The caller owns the returned executable only once it commits
+    /// the handle to the resource owner; until then this builder destroys it,
+    /// including while unwinding from a panic.
     unsafe fn build_graph<F: payload::Files>(
         &self,
         files: &F,
@@ -246,33 +287,23 @@ impl Bindings {
             )?;
             let mut handle = null_mut();
             driver.check("cuGraphCreate", (driver.graph_create)(&mut handle, 0))?;
-            if let Err(error) =
-                self.build_nodes(files, package, graph, handle, phase, dynamic_shared)
-            {
-                (driver.graph_destroy)(handle);
-                return Err(error);
-            }
+            let mut template = HandleGuard::new(driver.graph_destroy, handle);
+            self.build_nodes(files, package, graph, handle, phase, dynamic_shared)?;
             let mut executable = null_mut();
-            if let Err(error) = driver.check(
+            driver.check(
                 "cuGraphInstantiateWithFlags",
                 (driver.graph_instantiate)(&mut executable, handle, graph.flags),
-            ) {
-                (driver.graph_destroy)(handle);
-                return Err(error);
-            }
-            let uploaded = driver.check(
-                "cuGraphUpload",
-                (driver.graph_upload)(executable, null_mut()),
-            );
+            )?;
+            let mut built = HandleGuard::new(driver.executable_destroy, executable);
+            driver.check("cuGraphUpload", (driver.graph_upload)(executable, null_mut()))?;
             // The instantiated executable owns a complete copy of the topology;
-            // the template is retired once its upload is enqueued. A destroy
-            // failure leaks the template only; failing here would also strand
-            // the executable, which the caller has not yet taken ownership of.
-            (driver.graph_destroy)(handle);
-            if let Err(error) = uploaded {
-                (driver.executable_destroy)(executable);
-                return Err(error);
-            }
+            // the template is retired once the executable's upload is enqueued.
+            // A destroy failure leaks only the template; the guard still frees
+            // the uncommitted executable as this builder returns the error.
+            let retired = (driver.graph_destroy)(handle);
+            template.disarm();
+            driver.check("cuGraphDestroy", retired)?;
+            built.disarm();
             phase.advance(1);
             Ok(executable)
         }
@@ -1170,11 +1201,11 @@ impl NativeResources {
         // the first failure in graph order is the one reported. Executables are
         // committed in package order so replay ordinals match the execution
         // manifest. Each builder destroys its own template and any executable
-        // whose upload failed before returning.
+        // it has not handed back, including while unwinding from a panic.
         let bindings = &bindings;
         let next = AtomicUsize::new(0);
         let failed = AtomicBool::new(false);
-        let results: Mutex<Vec<Option<Result<(usize, String)>>>> =
+        let results: Mutex<Vec<Option<GraphBuildResult>>> =
             Mutex::new((0..package.graphs.len()).map(|_| None).collect());
         let scope_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             thread::scope(|scope| -> Result<()> {
@@ -1192,21 +1223,35 @@ impl NativeResources {
                                 let Some(graph) = package.graphs.get(index) else {
                                     return;
                                 };
-                                match unsafe {
-                                    bindings.build_graph(
-                                        files,
-                                        package,
-                                        graph,
-                                        phase,
-                                        dynamic_shared,
-                                    )
-                                } {
-                                    Ok(executable) => {
+                                // A builder that panics on one graph still
+                                // records a result so every claimed index
+                                // resolves and the other builders stop.
+                                let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                                    || unsafe {
+                                        bindings.build_graph(
+                                            files,
+                                            package,
+                                            graph,
+                                            phase,
+                                            dynamic_shared,
+                                        )
+                                    },
+                                ));
+                                match built {
+                                    Ok(Ok(executable)) => {
                                         results.lock().unwrap()[index] =
                                             Some(Ok((executable as usize, graph.name.clone())));
                                     }
-                                    Err(error) => {
+                                    Ok(Err(error)) => {
                                         results.lock().unwrap()[index] = Some(Err(error));
+                                        failed.store(true, Ordering::Relaxed);
+                                    }
+                                    Err(_) => {
+                                        results.lock().unwrap()[index] =
+                                            Some(Err(invalid(format!(
+                                                "graph {} build panicked",
+                                                graph.name
+                                            ))));
                                         failed.store(true, Ordering::Relaxed);
                                     }
                                 }
@@ -1222,7 +1267,7 @@ impl NativeResources {
         // frees them all.
         let mut results = results
             .into_inner()
-            .map_err(|_| invalid("graph builders panicked"))?;
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut failure: Option<crate::Error> = None;
         for (index, result) in results.drain(..).enumerate() {
             match result {
