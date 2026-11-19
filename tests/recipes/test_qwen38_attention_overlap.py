@@ -193,3 +193,40 @@ def test_selector_qkv_fork_join_and_rebound_cache(weights, rows, compiled, overl
             for name, value in expected_state.items():
                 torch.testing.assert_close(getattr(state, name), value, rtol=0, atol=0)
         graph.reset()
+
+
+@torch.no_grad()
+def test_projection_fork_reads_selector_metadata(weights):
+    """The projection fork declares the QSA metadata operands so the compiled schedule
+    materializes them before the fork's readiness, leaving b12x selection unordered
+    against the layer's main-stream Q/K/V work."""
+    module, weights = weights
+    device = torch.device("cuda:0")
+    rows = 1
+    arena = ScratchArena(device, overlap=True)
+    input_copy = torch.zeros(rows, 2560, dtype=torch.bfloat16, device=device)
+    scratch = QSAScratch.allocate(rows, device)
+    state = QSAState.allocate(pages=1, slots=1, device=device)
+    metadata = QSAMetadata.allocate(tokens=rows, batch=1, context=128, device=device)
+    rotary = RotaryTables.allocate(module.config, 128, device)
+    with PreparationSession(device=device, autotune=False, compile_workers=0) as session:
+        attention = PreparedAttention(module, weights, input_copy, scratch, state, metadata, rotary,
+            session=session, name="fork-reads", workspace=arena, projection_workspace=arena, max_cache_pages=2)
+        arena.freeze()
+        arena.finalize()
+        session.freeze()
+        state = state.resize_pages_for_preparation(2)
+        attention.rebind_pages_for_preparation(state)
+        assert attention.concurrent is not None
+        from ignition.preparation.compilation import ForwardTracer
+        from ignition.recipes.qwen38.attention_overlap import _SELECTOR_METADATA_FIELDS
+
+        traced = ForwardTracer()(lambda: attention(input_copy))
+        fork = [node for node in traced.graph.nodes if node.op == "call_function"
+                and node.target == torch.ops.flare.parallel_mx_projections.default]
+        assert len(fork) == 1
+        reads = fork[0].kwargs["selector_reads"]
+        expected = [(tuple(getattr(metadata, name).shape), getattr(metadata, name).dtype)
+                    for name in _SELECTOR_METADATA_FIELDS]
+        observed = sorted((tuple(node.meta["val"].shape), node.meta["val"].dtype) for node in reads)
+        assert observed == sorted(expected)

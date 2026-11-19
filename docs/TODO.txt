@@ -4,6 +4,14 @@
     reaches its 1024-token output limit. The TML prompt matches tml-renderers 0.4.1.
     Preserve the failing zero-effort cases in tests/server/test_inkling2.py.
 
+[ ] Qualify QSA selection overlap in Qwen3.8-Flash-Next decode graphs on SM121
+    tensor-parallel serving after a re-export: measure per-round speculative GPU
+    time for batch-1 widths 4-6 on two DGX Spark GB10 hosts and confirm with
+    qualify/graph_node_probe.py that the selection kernels execute alongside the
+    layer's KV write. If a decode-only gap remains, A/B the pinned FlashInfer
+    RoCE transport revision and inspect the shared-expert fork placement under
+    Inductor memory planning.
+
 [ ] Qualify Inkling 2 numerical agreement at long contexts and on fully
     populated large vision graphs. Canonical vision comparisons cover at most
     256 live patches.

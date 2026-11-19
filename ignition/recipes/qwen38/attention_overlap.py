@@ -20,6 +20,8 @@ _MUTABLE_BINDING_FIELDS = (
 )
 _DYNAMIC_FIELDS = ("query", "index_query", "raw_index_key", "request_ids", "query_positions",
                    "rope_positions", "sequence_lengths", "query_start_loc", "num_accepted_tokens", "is_prefilling")
+_SELECTOR_METADATA_FIELDS = ("request_ids", "query_positions", "rope_positions", "sequence_lengths",
+                             "query_start_loc", "num_accepted_tokens", "is_prefilling")
 
 
 @torch.library.custom_op("flare::parallel_qsa", mutates_args=("writes", "workspace"))
@@ -62,6 +64,9 @@ class ConcurrentAttention:
     The opaque QSA call reconstructs its binding from explicit tensor operands
     so compiler functionalization cannot detach mutations from their storage.
     Its source operand keeps projection input live through the selector join.
+    The projection fork declares the selector metadata it must order, so the
+    compiled schedule materializes that metadata before the fork's readiness
+    and b12x selection overlaps the layer's main-stream Q/K/V work.
     b12x owns selection, attention, and the selection-stream join. The context
     registry retains only weak references; the prepared attention owns its
     context until all captured graphs have drained.
@@ -111,13 +116,14 @@ class ConcurrentAttention:
         self.outputs = self.workspace = self.projection_workspaces = None
         self.arena = None
 
-    def project_runtime(self, source):
+    def project_runtime(self, source, metadata):
         outputs = [torch.empty_strided(shape, stride, dtype=dtype, device=source.device)
                    for shape, stride, dtype in self.output_layouts]
         workspaces = [torch.empty(size, dtype=torch.uint8, device=source.device)
                       for size in self.projection_workspace_bytes]
         _parallel_mx_projections(source, self.values, self.scales, outputs,
-            workspaces, self.plans, self.stream_handle, False)
+            workspaces, self.plans, self.stream_handle, False,
+            selector_reads=[getattr(metadata, name) for name in _SELECTOR_METADATA_FIELDS])
         return outputs, workspaces
 
     def attend_runtime(self, source, bindings, dynamic, projection_workspaces):
@@ -145,8 +151,11 @@ class ConcurrentAttention:
         bindings.update(zip(_MUTABLE_BINDING_FIELDS, writes, strict=True))
         binding = qsa.bind(self.attention.plan, scratch=workspace, **bindings,
                            selection_stream=self.stream, selection_done=self.done)
-        # Compiled metadata can be materialized after the projection-stream fork.
-        self.stream.wait_stream(torch.cuda.current_stream(workspace.device))
+        # b12x gates selection on this event and requires it before independent main
+        # Q/K/V work. Selector metadata is ordered by the projection fork, which reads
+        # it, so no main-stream wait belongs here; one would order selection after the
+        # layer's KV write on the shared auxiliary stream, also delaying the
+        # shared-expert branch queued behind it.
         self.ready.record(self.stream)
         dynamic = reads[count:count + len(self.dynamic_names)]
         qsa.run(binding, **dict(zip(self.dynamic_names, dynamic, strict=True)), index_ready=self.ready)

@@ -363,7 +363,8 @@ class PreparedAttention:
             projected_qkv = self.projections["qkv_proj"](source)
             projection_workspaces = None
         else:
-            (projected_qkv, projected_index), projection_workspaces = self.concurrent.project_runtime(source)
+            (projected_qkv, projected_index), projection_workspaces = self.concurrent.project_runtime(
+                source, metadata)
         q_width = self.q_heads * 512
         kv_width = self.kv_heads * 256
         projected_q = projected_qkv[:, :q_width].view(self.tokens, self.q_heads, 512)

@@ -594,8 +594,14 @@ def _parallel_mx_projections(
     source: torch.Tensor, values: list[torch.Tensor], scales: list[torch.Tensor],
     outputs: list[torch.Tensor], workspaces: list[torch.Tensor],
     plans: list[int], auxiliary_stream: int, join: bool = True,
+    selector_reads: list[torch.Tensor] = (),
 ) -> None:
     main = torch.cuda.current_stream(source.device)
+    # `selector_reads` declares tensors that a later branch on `auxiliary` reads but the
+    # main stream may materialize after this fork. Declaring them as fork operands pins
+    # their production before the fork in the compiled schedule, so the fork's wait below
+    # orders them for the auxiliary branch without ordering auxiliary work behind
+    # main-stream work that follows the fork.
     auxiliary = torch.cuda.ExternalStream(auxiliary_stream, device=source.device)
     auxiliary.wait_stream(main)
 
@@ -612,7 +618,8 @@ def _parallel_mx_projections(
 
 
 @_parallel_mx_projections.register_fake
-def _fake_parallel_mx_projections(source, values, scales, outputs, workspaces, plans, auxiliary_stream, join=True):
+def _fake_parallel_mx_projections(source, values, scales, outputs, workspaces, plans, auxiliary_stream,
+                                  join=True, selector_reads=()):
     pass
 
 
